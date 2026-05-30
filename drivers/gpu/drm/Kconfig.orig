@@ -370,8 +370,6 @@ source "drivers/gpu/drm/radeon/Kconfig"
 
 source "drivers/gpu/drm/amd/amdgpu/Kconfig"
 
-source "drivers/gpu/drm/evdi/Kconfig"
-
 source "drivers/gpu/drm/nouveau/Kconfig"
 
 source "drivers/gpu/drm/i915/Kconfig"
