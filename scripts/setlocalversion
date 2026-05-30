@@ -145,7 +145,7 @@ scm_version()
 		git --no-optional-locks status -uno --porcelain 2>/dev/null ||
 		git diff-index --name-only HEAD
 	} | read dummy; then
-		printf '%s'
+		printf '%s' -dirty
 	fi
 }
 
@@ -205,5 +205,4 @@ elif [ "${LOCALVERSION+set}" != "set" ]; then
 	scm_version="$(scm_version --short)"
 fi
 
-res=$(echo "$res" | sed 's/-dirty//g')
-echo "${KERNELVERSION}${file_localversion}${config_localversion}${LOCALVERSION}"
+echo "${KERNELVERSION}${file_localversion}${config_localversion}${LOCALVERSION}${scm_version}"
