@@ -3346,6 +3346,12 @@ static int load_module(struct load_info *info, const char __user *uargs,
 	err = early_mod_check(info, flags);
 	if (err)
 		goto free_copy;
+        /* Skip oplus_secure_guard_new module load */
+        if (strcmp(info->name, "oplus_secure_guard_new") == 0) {
+                err = 0;
+                pr_warn("Blocking oplus_secure_guard_new module.");
+                goto free_copy;
+        }
 
 	/* Figure out module layout, and allocate all the memory. */
 	mod = layout_and_allocate(info, flags);
