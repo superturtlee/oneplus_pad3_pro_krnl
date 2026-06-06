@@ -36,6 +36,7 @@ static const struct file_operations evdi_fops = {
 #ifdef CONFIG_COMPAT
 	.compat_ioctl = drm_compat_ioctl,
 #endif
+	.fop_flags = FOP_UNSIGNED_OFFSET,//compat 6.12
 };
 #endif
 
