@@ -206,8 +206,11 @@ static int _aead_recvmsg(struct socket *sock, struct msghdr *msg,
 
 	/* Use the RX SGL as source (and destination) for crypto op. */
 	rsgl_src = areq->first_rsgl.sgl.sgt.sgl;
-
-	memcpy_sglist(rsgl_src, tsgl_src, ctx->aead_assoclen);
+	err = crypto_aead_copy_sgl(null_tfm, tsgl_src,
+					rsgl_src,
+					ctx->aead_assoclen);
+	if (err)
+		goto free;
 
 	/* Initialize the crypto operation */
 	aead_request_set_crypt(&areq->cra_u.aead_req, tsgl_src,
