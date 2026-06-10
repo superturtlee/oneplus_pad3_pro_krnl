@@ -33,6 +33,7 @@ MODULE_IMPORT_NS(DMA_BUF);
 
 static struct kmem_cache *evdi_gem_cache;
 
+static int evdi_gem_get_pages(struct evdi_gem_object *obj, gfp_t gfpmask);
 static int evdi_pin_pages(struct evdi_gem_object *obj);
 static void evdi_unpin_pages(struct evdi_gem_object *obj);
 
@@ -229,11 +230,17 @@ int evdi_drm_gem_mmap(struct file *filp, struct vm_area_struct *vma)
 	if (ret)
 		return ret;
 
+	/*
+	 * drm_gem_mmap_obj() sets VM_IO | VM_PFNMAP when obj->funcs->mmap is
+	 * NULL (kernel/drivers/gpu/drm/drm_gem.c:1122). Both must be cleared:
+	 * VM_PFNMAP is incompatible with VM_MIXEDMAP, and VM_IO is invalid for
+	 * shmem-backed pages inserted via vmf_insert_page() on ARM64.
+	 */
 #if KERNEL_VERSION(6, 1, 0) <= LINUX_VERSION_CODE
 	vm_flags_mod(vma, VM_MIXEDMAP | VM_DONTDUMP | VM_DONTEXPAND | VM_DONTCOPY,
-		     VM_PFNMAP);
+		     VM_PFNMAP | VM_IO);
 #else
-	vma->vm_flags &= ~VM_PFNMAP;
+	vma->vm_flags &= ~(VM_PFNMAP | VM_IO);
 	vma->vm_flags |= VM_MIXEDMAP | VM_DONTDUMP | VM_DONTEXPAND | VM_DONTCOPY;
 #endif
 
@@ -269,16 +276,37 @@ int evdi_gem_fault(struct vm_fault *vmf)
 	page_offset = (vmf->address - vma->vm_start) >> PAGE_SHIFT;
 	num_pages = obj->base.size >> PAGE_SHIFT;
 
-	if (!obj->pages || page_offset >= num_pages)
+	if (page_offset >= num_pages)
 		return VM_FAULT_SIGBUS;
 
-	page = obj->pages[page_offset];
+	mutex_lock(&obj->pages_lock);
+	if (!obj->pages) {
+		ret = evdi_gem_get_pages(obj, GFP_KERNEL);
+		if (ret) {
+			mutex_unlock(&obj->pages_lock);
+			return VM_FAULT_SIGBUS;
+		}
+	}
 
-#if KERNEL_VERSION(4, 17, 0) <= LINUX_VERSION_CODE
-	ret = vmf_insert_page(vma, vmf->address, page);
+	page = obj->pages[page_offset];
+	get_page(page);
+	mutex_unlock(&obj->pages_lock);
+
+	/*
+	 * vmf_insert_page() returns vm_fault_t (e.g. VM_FAULT_NOPAGE = 0x100),
+	 * NOT errno. The old switch matched errno values and fell through to
+	 * VM_FAULT_SIGBUS on every successful insert.
+	 * See kernel/include/linux/mm_types.h:1319, kernel/include/linux/mm.h:3731
+	 */
+#if KERNEL_VERSION(6, 1, 0) <= LINUX_VERSION_CODE
+	{
+		vm_fault_t vmf_ret = vmf_insert_page(vma, vmf->address, page);
+		put_page(page);
+		return vmf_ret;
+	}
 #else
 	ret = vm_insert_page(vma, vmf->address, page);
-#endif
+	put_page(page);
 
 	switch (ret) {
 	case -EAGAIN:
@@ -291,6 +319,7 @@ int evdi_gem_fault(struct vm_fault *vmf)
 	default:
 		return VM_FAULT_SIGBUS;
 	}
+#endif
 }
 
 static int evdi_gem_get_pages(struct evdi_gem_object *obj, gfp_t gfpmask)
