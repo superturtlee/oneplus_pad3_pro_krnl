@@ -18,6 +18,7 @@
 #include <linux/slab.h>
 #include <linux/overflow.h>
 #include <linux/unaligned.h>
+#include <net/ip.h>
 #include <net/ipv6.h>
 #include <net/netlink.h>
 #include <net/pkt_sched.h>
