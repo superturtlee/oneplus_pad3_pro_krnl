@@ -2147,7 +2147,11 @@ int dm_bufio_write_dirty_buffers(struct dm_bufio_client *c)
 
 		cache_put_and_wake(c, b);
 
-		cond_resched();
+		if (need_resched()) {
+			dm_bufio_unlock(c);
+			cond_resched();
+			dm_bufio_lock(c);
+		}
 	}
 	lru_iter_end(&it);
 
