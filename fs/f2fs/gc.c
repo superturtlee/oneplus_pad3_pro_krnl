@@ -144,7 +144,7 @@ do_gc:
 					FOREGROUND : BACKGROUND);
 
 		sync_mode = (F2FS_OPTION(sbi).bggc_mode == BGGC_MODE_SYNC) ||
-				gc_boost;
+			(gc_boost && gc_th->boost_gc_greedy);
 
 		/* foreground GC was been triggered via f2fs_balance_fs() */
 		if (foreground)
@@ -200,6 +200,8 @@ int f2fs_start_gc_thread(struct f2fs_sb_info *sbi)
 
 	gc_th->urgent_sleep_time = DEF_GC_THREAD_URGENT_SLEEP_TIME;
 	gc_th->valid_thresh_ratio = DEF_GC_THREAD_VALID_THRESH_RATIO;
+	gc_th->boost_gc_multiple = BOOST_GC_MULTIPLE;
+	gc_th->boost_gc_greedy = GC_GREEDY;
 
 	if (f2fs_sb_has_blkzoned(sbi)) {
 		gc_th->min_sleep_time = DEF_GC_THREAD_MIN_SLEEP_TIME_ZONED;
@@ -366,15 +368,20 @@ static unsigned int check_bg_victims(struct f2fs_sb_info *sbi)
 static unsigned int get_cb_cost(struct f2fs_sb_info *sbi, unsigned int segno)
 {
 	struct sit_info *sit_i = SIT_I(sbi);
+	unsigned int secno = GET_SEC_FROM_SEG(sbi, segno);
+	unsigned int start = GET_SEG_FROM_SEC(sbi, secno);
 	unsigned long long mtime = 0;
 	unsigned int vblocks;
 	unsigned char age = 0;
 	unsigned char u;
+	unsigned int i;
 	unsigned int usable_segs_per_sec = f2fs_usable_segs_in_sec(sbi);
 
-	mtime = f2fs_get_section_mtime(sbi, segno);
-	f2fs_bug_on(sbi, mtime == INVALID_MTIME);
+	for (i = 0; i < usable_segs_per_sec; i++)
+		mtime += get_seg_entry(sbi, start + i)->mtime;
 	vblocks = get_valid_blocks(sbi, segno, true);
+
+	mtime = div_u64(mtime, usable_segs_per_sec);
 	vblocks = div_u64(vblocks, usable_segs_per_sec);
 
 	u = BLKS_TO_SEGS(sbi, vblocks * 100);
@@ -519,7 +526,10 @@ static void add_victim_entry(struct f2fs_sb_info *sbi,
 				struct victim_sel_policy *p, unsigned int segno)
 {
 	struct sit_info *sit_i = SIT_I(sbi);
+	unsigned int secno = GET_SEC_FROM_SEG(sbi, segno);
+	unsigned int start = GET_SEG_FROM_SEC(sbi, secno);
 	unsigned long long mtime = 0;
+	unsigned int i;
 
 	if (unlikely(is_sbi_flag_set(sbi, SBI_CP_DISABLED))) {
 		if (p->gc_mode == GC_AT &&
@@ -527,8 +537,9 @@ static void add_victim_entry(struct f2fs_sb_info *sbi,
 			return;
 	}
 
-	mtime = f2fs_get_section_mtime(sbi, segno);
-	f2fs_bug_on(sbi, mtime == INVALID_MTIME);
+	for (i = 0; i < SEGS_PER_SEC(sbi); i++)
+		mtime += get_seg_entry(sbi, start + i)->mtime;
+	mtime = div_u64(mtime, SEGS_PER_SEC(sbi));
 
 	/* Handle if the system time has changed by the user */
 	if (mtime < sit_i->min_mtime)
@@ -776,7 +787,7 @@ int f2fs_get_victim(struct f2fs_sb_info *sbi, unsigned int *result,
 {
 	struct dirty_seglist_info *dirty_i = DIRTY_I(sbi);
 	struct sit_info *sm = SIT_I(sbi);
-	struct victim_sel_policy p;
+	struct victim_sel_policy p = {0};
 	unsigned int secno, last_victim;
 	unsigned int last_segment;
 	unsigned int nsearched;
@@ -809,14 +820,11 @@ retry:
 			goto out;
 		}
 
-		if (sec_usage_check(sbi, GET_SEC_FROM_SEG(sbi, *result))) {
+		if (sec_usage_check(sbi, GET_SEC_FROM_SEG(sbi, *result)))
 			ret = -EBUSY;
-			goto out;
-		}
-		if (gc_type == FG_GC)
-			clear_bit(GET_SEC_FROM_SEG(sbi, *result), dirty_i->victim_secmap);
-		p.min_segno = *result;
-		goto got_result;
+		else
+			p.min_segno = *result;
+		goto out;
 	}
 
 	ret = -ENODATA;
@@ -1418,7 +1426,7 @@ static int move_data_block(struct inode *inode, block_t bidx,
 				page_address(mpage), PAGE_SIZE);
 	f2fs_put_page(mpage, 1);
 
-	f2fs_invalidate_internal_cache(fio.sbi, fio.old_blkaddr, 1);
+	f2fs_invalidate_internal_cache(fio.sbi, fio.old_blkaddr);
 
 	set_page_dirty(fio.encrypted_page);
 	if (clear_page_dirty_for_io(fio.encrypted_page))
@@ -1452,14 +1460,14 @@ out:
 }
 
 static int move_data_page(struct inode *inode, block_t bidx, int gc_type,
-						unsigned int segno, int off)
+							unsigned int segno, int off)
 {
-	struct folio *folio;
+	struct page *page;
 	int err = 0;
 
-	folio = f2fs_get_lock_data_folio(inode, bidx, true);
-	if (IS_ERR(folio))
-		return PTR_ERR(folio);
+	page = f2fs_get_lock_data_page(inode, bidx, true);
+	if (IS_ERR(page))
+		return PTR_ERR(page);
 
 	if (!check_valid_map(F2FS_I_SB(inode), segno, off)) {
 		err = -ENOENT;
@@ -1471,12 +1479,12 @@ static int move_data_page(struct inode *inode, block_t bidx, int gc_type,
 		goto out;
 
 	if (gc_type == BG_GC) {
-		if (folio_test_writeback(folio)) {
+		if (folio_test_writeback(page_folio(page))) {
 			err = -EAGAIN;
 			goto out;
 		}
-		folio_mark_dirty(folio);
-		set_page_private_gcing(&folio->page);
+		set_page_dirty(page);
+		set_page_private_gcing(page);
 	} else {
 		struct f2fs_io_info fio = {
 			.sbi = F2FS_I_SB(inode),
@@ -1486,37 +1494,37 @@ static int move_data_page(struct inode *inode, block_t bidx, int gc_type,
 			.op = REQ_OP_WRITE,
 			.op_flags = REQ_SYNC,
 			.old_blkaddr = NULL_ADDR,
-			.page = &folio->page,
+			.page = page,
 			.encrypted_page = NULL,
 			.need_lock = LOCK_REQ,
 			.io_type = FS_GC_DATA_IO,
 		};
-		bool is_dirty = folio_test_dirty(folio);
+		bool is_dirty = PageDirty(page);
 
 retry:
-		f2fs_folio_wait_writeback(folio, DATA, true, true);
+		f2fs_wait_on_page_writeback(page, DATA, true, true);
 
-		folio_mark_dirty(folio);
-		if (folio_clear_dirty_for_io(folio)) {
+		set_page_dirty(page);
+		if (clear_page_dirty_for_io(page)) {
 			inode_dec_dirty_pages(inode);
 			f2fs_remove_dirty_inode(inode);
 		}
 
-		set_page_private_gcing(&folio->page);
+		set_page_private_gcing(page);
 
 		err = f2fs_do_write_data_page(&fio);
 		if (err) {
-			clear_page_private_gcing(&folio->page);
+			clear_page_private_gcing(page);
 			if (err == -ENOMEM) {
 				memalloc_retry_wait(GFP_NOFS);
 				goto retry;
 			}
 			if (is_dirty)
-				folio_mark_dirty(folio);
+				set_page_dirty(page);
 		}
 	}
 out:
-	f2fs_folio_put(folio, true);
+	f2fs_put_page(page, 1);
 	return err;
 }
 
@@ -1545,6 +1553,7 @@ next_step:
 	entry = sum;
 
 	for (off = 0; off < usable_blks_in_seg; off++, entry++) {
+		struct page *data_page;
 		struct inode *inode;
 		struct node_info dni; /* dnode info for the data */
 		unsigned int ofs_in_node, nofs;
@@ -1587,7 +1596,6 @@ next_step:
 		ofs_in_node = le16_to_cpu(entry->ofs_in_node);
 
 		if (phase == 3) {
-			struct folio *data_folio;
 			int err;
 
 			inode = f2fs_iget(sb, dni.ino);
@@ -1638,15 +1646,15 @@ next_step:
 				continue;
 			}
 
-			data_folio = f2fs_get_read_data_folio(inode, start_bidx,
+			data_page = f2fs_get_read_data_page(inode, start_bidx,
 							REQ_RAHEAD, true, NULL);
 			f2fs_up_write(&F2FS_I(inode)->i_gc_rwsem[WRITE]);
-			if (IS_ERR(data_folio)) {
+			if (IS_ERR(data_page)) {
 				iput(inode);
 				continue;
 			}
 
-			f2fs_folio_put(data_folio, false);
+			f2fs_put_page(data_page, 0);
 			add_gc_inode(gc_list, inode);
 			continue;
 		}
@@ -1754,7 +1762,7 @@ static int do_garbage_collect(struct f2fs_sb_info *sbi,
 					!has_enough_free_blocks(sbi,
 					sbi->gc_thread->boost_zoned_gc_percent))
 				window_granularity *=
-					BOOST_GC_MULTIPLE;
+					sbi->gc_thread->boost_gc_multiple;
 
 			end_segno = start_segno + window_granularity;
 		}
@@ -2071,6 +2079,7 @@ int f2fs_gc_range(struct f2fs_sb_info *sbi,
 	if (unlikely(f2fs_cp_error(sbi)))
 		return -EIO;
 
+	stat_inc_gc_call_count(sbi, FOREGROUND);
 	for (segno = start_seg; segno <= end_seg; segno += SEGS_PER_SEC(sbi)) {
 		struct gc_inode_list gc_list = {
 			.ilist = LIST_HEAD_INIT(gc_list.ilist),
@@ -2082,9 +2091,6 @@ int f2fs_gc_range(struct f2fs_sb_info *sbi,
 		 * log in parallel.
 		 */
 		if (!get_valid_blocks(sbi, segno, true))
-			continue;
-
-		if (IS_CURSEC(sbi, GET_SEC_FROM_SEG(sbi, segno)))
 			continue;
 
 		if (IS_CURSEC(sbi, GET_SEC_FROM_SEG(sbi, segno)))

@@ -20,19 +20,11 @@
 #include "segment.h"
 #include "iostat.h"
 #include <trace/events/f2fs.h>
-#include <trace/hooks/fs.h>
 
-#define DEFAULT_CHECKPOINT_IOPRIO (IOPRIO_PRIO_VALUE(IOPRIO_CLASS_RT, 3))
+#define DEFAULT_CHECKPOINT_IOPRIO (IOPRIO_PRIO_VALUE(IOPRIO_CLASS_BE, 3))
 
 static struct kmem_cache *ino_entry_slab;
 struct kmem_cache *f2fs_inode_entry_slab;
-
-void _trace_android_rvh_f2fs_down_read(wait_queue_head_t *read_waiters,
-					struct rw_semaphore *rwsem, bool *skip)
-{
-	trace_android_rvh_f2fs_down_read(read_waiters, rwsem, skip);
-}
-EXPORT_SYMBOL_GPL(_trace_android_rvh_f2fs_down_read);
 
 void f2fs_stop_checkpoint(struct f2fs_sb_info *sbi, bool end_io,
 						unsigned char reason)
@@ -66,7 +58,7 @@ static struct page *__get_meta_page(struct f2fs_sb_info *sbi, pgoff_t index,
 							bool is_meta)
 {
 	struct address_space *mapping = META_MAPPING(sbi);
-	struct folio *folio;
+	struct page *page;
 	struct f2fs_io_info fio = {
 		.sbi = sbi,
 		.type = META,
@@ -82,37 +74,37 @@ static struct page *__get_meta_page(struct f2fs_sb_info *sbi, pgoff_t index,
 	if (unlikely(!is_meta))
 		fio.op_flags &= ~REQ_META;
 repeat:
-	folio = f2fs_grab_cache_folio(mapping, index, false);
-	if (IS_ERR(folio)) {
+	page = f2fs_grab_cache_page(mapping, index, false);
+	if (!page) {
 		cond_resched();
 		goto repeat;
 	}
-	if (folio_test_uptodate(folio))
+	if (PageUptodate(page))
 		goto out;
 
-	fio.page = &folio->page;
+	fio.page = page;
 
 	err = f2fs_submit_page_bio(&fio);
 	if (err) {
-		f2fs_folio_put(folio, true);
+		f2fs_put_page(page, 1);
 		return ERR_PTR(err);
 	}
 
 	f2fs_update_iostat(sbi, NULL, FS_META_READ_IO, F2FS_BLKSIZE);
 
-	folio_lock(folio);
-	if (unlikely(folio->mapping != mapping)) {
-		f2fs_folio_put(folio, true);
+	lock_page(page);
+	if (unlikely(page->mapping != mapping)) {
+		f2fs_put_page(page, 1);
 		goto repeat;
 	}
 
-	if (unlikely(!folio_test_uptodate(folio))) {
-		f2fs_handle_page_eio(sbi, folio, META);
-		f2fs_folio_put(folio, true);
+	if (unlikely(!PageUptodate(page))) {
+		f2fs_handle_page_eio(sbi, page_folio(page), META);
+		f2fs_put_page(page, 1);
 		return ERR_PTR(-EIO);
 	}
 out:
-	return &folio->page;
+	return page;
 }
 
 struct page *f2fs_get_meta_page(struct f2fs_sb_info *sbi, pgoff_t index)
@@ -389,6 +381,12 @@ redirty_out:
 	return AOP_WRITEPAGE_ACTIVATE;
 }
 
+static int f2fs_write_meta_page(struct page *page,
+				struct writeback_control *wbc)
+{
+	return __f2fs_write_meta_page(page, wbc, FS_META_IO);
+}
+
 static int f2fs_write_meta_pages(struct address_space *mapping,
 				struct writeback_control *wbc)
 {
@@ -509,6 +507,7 @@ static bool f2fs_dirty_meta_folio(struct address_space *mapping,
 }
 
 const struct address_space_operations f2fs_meta_aops = {
+	.writepage	= f2fs_write_meta_page,
 	.writepages	= f2fs_write_meta_pages,
 	.dirty_folio	= f2fs_dirty_meta_folio,
 	.invalidate_folio = f2fs_invalidate_folio,
@@ -712,25 +711,6 @@ static int recover_orphan_inode(struct f2fs_sb_info *sbi, nid_t ino)
 		iput(inode);
 		goto err_out;
 	}
-
-#ifdef CONFIG_F2FS_FS_DEDUP
-	if (is_inode_flag_set(inode, FI_REVOKE_DEDUP)) {
-		f2fs_notice(sbi, "recover orphan: ino[%u] set revoke, flags[%lu]",
-				ino, F2FS_I(inode)->flags[0]);
-		f2fs_bug_on(sbi, is_inode_flag_set(inode, FI_DOING_DEDUP));
-		err = f2fs_truncate_dedup_inode(inode, FI_REVOKE_DEDUP);
-		iput(inode);
-		return err;
-	}
-
-	if (is_inode_flag_set(inode, FI_DOING_DEDUP)) {
-		f2fs_notice(sbi, "recover orphan: ino[%u] set doing dedup, flags[%lu]",
-				ino, F2FS_I(inode)->flags[0]);
-		err = f2fs_truncate_dedup_inode(inode, FI_DOING_DEDUP);
-		iput(inode);
-		return err;
-	}
-#endif
 
 	clear_nlink(inode);
 
@@ -1257,7 +1237,7 @@ static int block_operations(struct f2fs_sb_info *sbi)
 retry_flush_quotas:
 	f2fs_lock_all(sbi);
 	if (__need_flush_quota(sbi)) {
-		bool need_lock = sbi->umount_lock_holder != current;
+		int locked;
 
 		if (++cnt > DEFAULT_RETRY_QUOTA_FLUSH_COUNT) {
 			set_sbi_flag(sbi, SBI_QUOTA_SKIP_FLUSH);
@@ -1266,13 +1246,11 @@ retry_flush_quotas:
 		}
 		f2fs_unlock_all(sbi);
 
-		/* don't grab s_umount lock during mount/umount/remount/freeze/quotactl */
-		if (!need_lock) {
-			f2fs_do_quota_sync(sbi->sb, -1);
-		} else if (down_read_trylock(&sbi->sb->s_umount)) {
-			f2fs_do_quota_sync(sbi->sb, -1);
+		/* only failed during mount/umount/freeze/quotactl */
+		locked = down_read_trylock(&sbi->sb->s_umount);
+		f2fs_quota_sync(sbi->sb, -1);
+		if (locked)
 			up_read(&sbi->sb->s_umount);
-		}
 		cond_resched();
 		goto retry_flush_quotas;
 	}
@@ -1880,8 +1858,7 @@ int f2fs_issue_checkpoint(struct f2fs_sb_info *sbi)
 	struct cp_control cpc;
 
 	cpc.reason = __get_cp_reason(sbi);
-	if (!test_opt(sbi, MERGE_CHECKPOINT) || cpc.reason != CP_SYNC ||
-		sbi->umount_lock_holder == current) {
+	if (!test_opt(sbi, MERGE_CHECKPOINT) || cpc.reason != CP_SYNC) {
 		int ret;
 
 		f2fs_down_write(&sbi->gc_lock);
@@ -1909,18 +1886,10 @@ int f2fs_issue_checkpoint(struct f2fs_sb_info *sbi)
 	if (waitqueue_active(&cprc->ckpt_wait_queue))
 		wake_up(&cprc->ckpt_wait_queue);
 
-	if (cprc->f2fs_issue_ckpt) {
-		bool prio_changed = false;
-		int saved_prio;
-
-		trace_android_vh_f2fs_improve_priority(cprc->f2fs_issue_ckpt, &saved_prio,
-						&prio_changed);
+	if (cprc->f2fs_issue_ckpt)
 		wait_for_completion(&req.wait);
-		if (prio_changed)
-			trace_android_vh_f2fs_restore_priority(cprc->f2fs_issue_ckpt, saved_prio);
-	} else {
+	else
 		flush_remained_ckpt_reqs(sbi, &req);
-	}
 
 	return req.ret;
 }
