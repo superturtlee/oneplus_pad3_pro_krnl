@@ -52,6 +52,11 @@ static inline u32 xsk_pool_get_rx_frame_size(struct xsk_buff_pool *pool)
 	return xsk_pool_get_chunk_size(pool) - xsk_pool_get_headroom(pool);
 }
 
+static inline u32 __xsk_pool_get_rx_frame_size(struct xsk_buff_pool *pool)
+{
+	return xsk_pool_get_chunk_size(pool) - xsk_pool_get_headroom(pool);
+}
+
 static inline void xsk_pool_set_rxq_info(struct xsk_buff_pool *pool,
 					 struct xdp_rxq_info *rxq)
 {
