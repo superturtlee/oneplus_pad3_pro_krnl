@@ -241,6 +241,7 @@ static void esp_output_done(void *data, int err)
 				kfree_skb(skb);
 		} else {
 			xfrm_output_resume(skb->sk, skb, err);
+		}
 	}
 }
 
