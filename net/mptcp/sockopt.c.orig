@@ -159,10 +159,10 @@ static int mptcp_setsockopt_sol_socket_tstamp(struct mptcp_sock *msk, int optnam
 	lock_sock(sk);
 	mptcp_for_each_subflow(msk, subflow) {
 		struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
-		lock_sock(ssk);
+		bool slow = lock_sock_fast(ssk);
 
 		sock_set_timestamp(sk, optname, !!val);
-		release_sock(ssk);
+		unlock_sock_fast(ssk, slow);
 	}
 
 	release_sock(sk);
@@ -235,10 +235,10 @@ static int mptcp_setsockopt_sol_socket_timestamping(struct mptcp_sock *msk,
 
 	mptcp_for_each_subflow(msk, subflow) {
 		struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
-		lock_sock(ssk);
+		bool slow = lock_sock_fast(ssk);
 
 		sock_set_timestamping(sk, optname, timestamping);
-		release_sock(ssk);
+		unlock_sock_fast(ssk, slow);
 	}
 
 	release_sock(sk);
