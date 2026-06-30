@@ -239,8 +239,11 @@ static int crypto_authenc_esn_decrypt_tail(struct aead_request *req,
 		scatterwalk_map_and_copy(tmp, dst, 4, 4, 0);
 		scatterwalk_map_and_copy(tmp + 1, dst, assoclen + cryptlen, 4, 0);
 		scatterwalk_map_and_copy(tmp, dst, 0, 8, 1);
-	} else
-		memcpy_sglist(dst, src, assoclen);
+	} else{
+		err = crypto_authenc_esn_copy(req, assoclen);
+		if (err)
+			return err;
+	}
 
 	if (crypto_memneq(ihash, ohash, authsize))
 		return -EBADMSG;
@@ -308,7 +311,9 @@ static int crypto_authenc_esn_decrypt(struct aead_request *req)
 
 		src = scatterwalk_ffwd(areq_ctx->src, src, 8);
 		dst = scatterwalk_ffwd(areq_ctx->dst, dst, 4);
-		memcpy_sglist(dst, src, assoclen + cryptlen - 8);
+		err = crypto_authenc_esn_copy(req, assoclen + cryptlen - 8);
+		if (err)
+			return err;
 		dst = req->dst;
 	}
 
