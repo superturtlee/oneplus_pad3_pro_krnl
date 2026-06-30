@@ -22,6 +22,9 @@
 #include "acl.h"
 #include <trace/events/f2fs.h>
 
+#undef CREATE_TRACE_POINTS
+#include <trace/hooks/fs.h>
+
 static inline bool is_extension_exist(const unsigned char *s, const char *sub,
 						bool tmp_ext, bool tmp_dot)
 {
@@ -280,7 +283,10 @@ static struct inode *f2fs_new_inode(struct mnt_idmap *idmap,
 
 	if (f2fs_sb_has_extra_attr(sbi)) {
 		set_inode_flag(inode, FI_EXTRA_ATTR);
-		fi->i_extra_isize = F2FS_TOTAL_EXTRA_ATTR_SIZE;
+		if (sbi->oplus_feats & OPLUS_FEAT_DEDUP)
+			fi->i_extra_isize = F2FS_TOTAL_EXTRA_ATTR_SIZE;
+		else
+			fi->i_extra_isize = F2FS_LEGACY_EXTRA_ATTR_SIZE;
 	}
 
 	if (test_opt(sbi, INLINE_XATTR))
@@ -341,6 +347,7 @@ fail_drop:
 	trace_f2fs_new_inode(inode, err);
 	dquot_drop(inode);
 	inode->i_flags |= S_NOQUOTA;
+	make_bad_inode(inode);
 	if (nid_free)
 		set_inode_flag(inode, FI_FREE_NID);
 	clear_nlink(inode);
@@ -375,6 +382,7 @@ static int f2fs_create(struct mnt_idmap *idmap, struct inode *dir,
 	inode->i_mapping->a_ops = &f2fs_dblock_aops;
 	ino = inode->i_ino;
 
+	trace_android_vh_f2fs_create(inode, dentry);
 	f2fs_lock_op(sbi);
 	err = f2fs_add_link(dentry, inode);
 	if (err)
@@ -501,6 +509,14 @@ static struct dentry *f2fs_lookup(struct inode *dir, struct dentry *dentry,
 		goto out;
 	}
 
+	if (inode->i_nlink == 0) {
+		f2fs_warn(F2FS_I_SB(inode), "%s: inode (ino=%lx) has zero i_nlink",
+			  __func__, inode->i_ino);
+		err = -EFSCORRUPTED;
+		set_sbi_flag(F2FS_I_SB(inode), SBI_NEED_FSCK);
+		goto out_iput;
+	}
+
 	if (IS_ENCRYPTED(dir) &&
 	    (S_ISDIR(inode->i_mode) || S_ISLNK(inode->i_mode)) &&
 	    !fscrypt_has_permitted_context(dir, inode)) {
@@ -557,6 +573,15 @@ static int f2fs_unlink(struct inode *dir, struct dentry *dentry)
 	if (!de) {
 		if (IS_ERR(page))
 			err = PTR_ERR(page);
+		goto fail;
+	}
+
+	if (unlikely(inode->i_nlink == 0)) {
+		f2fs_warn(F2FS_I_SB(inode), "%s: inode (ino=%lx) has zero i_nlink",
+			  __func__, inode->i_ino);
+		err = -EFSCORRUPTED;
+		set_sbi_flag(F2FS_I_SB(inode), SBI_NEED_FSCK);
+		f2fs_put_page(page, 0);
 		goto fail;
 	}
 
@@ -1045,11 +1070,9 @@ static int f2fs_rename(struct mnt_idmap *idmap, struct inode *old_dir,
 	if (whiteout) {
 		set_inode_flag(whiteout, FI_INC_LINK);
 		err = f2fs_add_link(old_dentry, whiteout);
-		if (err) {
-			d_invalidate(old_dentry);
-			d_invalidate(new_dentry);
+		if (err)
 			goto put_out_dir;
-		}
+
 		spin_lock(&whiteout->i_lock);
 		whiteout->i_state &= ~I_LINKABLE;
 		spin_unlock(&whiteout->i_lock);
@@ -1360,3 +1383,33 @@ const struct inode_operations f2fs_special_inode_operations = {
 	.set_acl	= f2fs_set_acl,
 	.listxattr	= f2fs_listxattr,
 };
+
+void f2fs_update_atime(struct inode *inode, bool oneshot)
+{
+#ifdef CONFIG_F2FS_FS_COMPRESSION_FIXED_OUTPUT
+	struct f2fs_inode_info *fi = F2FS_I(inode);
+
+	if (!f2fs_compressed_file(inode))
+		return;
+
+	if (!sb_start_write_trylock(inode->i_sb))
+		return;
+
+	if (!inode_trylock(inode))
+		goto out_unlock_sb;
+
+	if (IS_RDONLY(inode))
+		goto out_unlock_inode;
+
+	if (fi->i_compress_flag & COMPRESS_ATIME_MASK) {
+		if (oneshot)
+			fi->i_compress_flag &= ~COMPRESS_ATIME_MASK;
+		inode_update_time(inode, S_ATIME);
+	}
+
+out_unlock_inode:
+	inode_unlock(inode);
+out_unlock_sb:
+	sb_end_write(inode->i_sb);
+#endif
+}
