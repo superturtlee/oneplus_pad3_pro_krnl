@@ -51,7 +51,7 @@ struct erofs_device_info {
 	struct erofs_fscache *fscache;
 	struct file *file;
 	struct dax_device *dax_dev;
-	u64 fsoff, dax_part_off;
+	u64 dax_part_off;
 
 	u32 blocks;
 	u32 mapped_blkaddr;
@@ -66,10 +66,6 @@ enum {
 struct erofs_mount_opts {
 	/* current strategy of how to use managed cache */
 	unsigned char cache_strategy;
-	/* strategy of sync decompression (0 - auto, 1 - force on, 2 - force off) */
-	unsigned int sync_decompress;
-	/* threshold for decompression synchronously */
-	unsigned int max_sync_decompress_pages;
 	unsigned int mount_opt;
 };
 
@@ -123,6 +119,7 @@ struct erofs_sb_info {
 	/* managed XArray arranged in physical block number */
 	struct xarray managed_pslots;
 
+	unsigned int sync_decompress;	/* strategy for sync decompression */
 	unsigned int shrinker_run_no;
 	u16 available_compr_algs;
 
@@ -166,7 +163,6 @@ struct erofs_sb_info {
 	/* sysfs support */
 	struct kobject s_kobj;		/* /sys/fs/erofs/<devname> */
 	struct completion s_kobj_unregister;
-	erofs_off_t dir_ra_bytes;
 
 	/* fscache support */
 	struct fscache_volume *volume;
@@ -214,7 +210,6 @@ enum erofs_kmap_type {
 struct erofs_buf {
 	struct address_space *mapping;
 	struct file *file;
-	u64 off;
 	struct page *page;
 	void *base;
 	enum erofs_kmap_type kmap_type;
@@ -253,9 +248,6 @@ EROFS_FEATURE_FUNCS(xattr_filter, compat, COMPAT_XATTR_FILTER)
 #define EROFS_I_BL_XATTR_BIT	(BITS_PER_LONG - 1)
 #define EROFS_I_BL_Z_BIT	(BITS_PER_LONG - 2)
 
-/* default readahead size of directories */
-#define EROFS_DIR_RA_BYTES	16384
-
 struct erofs_inode {
 	erofs_nid_t nid;
 
@@ -280,7 +272,7 @@ struct erofs_inode {
 		struct {
 			unsigned short z_advise;
 			unsigned char  z_algorithmtype[2];
-			unsigned char  z_logical_clusterbits;
+			unsigned char  z_lclusterbits;
 			unsigned long  z_tailextent_headlcn;
 			erofs_off_t    z_fragmentoff;
 			unsigned short z_idata_size;
@@ -448,6 +440,8 @@ static inline void erofs_pagepool_add(struct page **pagepool, struct page *page)
 void erofs_release_pages(struct page **pagepool);
 
 #ifdef CONFIG_EROFS_FS_ZIP
+#define MNGD_MAPPING(sbi)	((sbi)->managed_cache->i_mapping)
+
 extern atomic_long_t erofs_global_shrink_cnt;
 void erofs_shrinker_register(struct super_block *sb);
 void erofs_shrinker_unregister(struct super_block *sb);

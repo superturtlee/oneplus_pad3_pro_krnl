@@ -9,6 +9,7 @@
 #include <linux/cpuhotplug.h>
 #include <trace/events/erofs.h>
 
+#define Z_EROFS_MAX_SYNC_DECOMPRESS_BYTES	12288
 #define Z_EROFS_PCLUSTER_MAX_PAGES	(Z_EROFS_PCLUSTER_MAX_SIZE / PAGE_SIZE)
 #define Z_EROFS_INLINE_BVECS		2
 
@@ -109,7 +110,6 @@ static inline unsigned int z_erofs_pclusterpages(struct z_erofs_pcluster *pcl)
 	return PAGE_ALIGN(pcl->pclustersize) >> PAGE_SHIFT;
 }
 
-#define MNGD_MAPPING(sbi)	((sbi)->managed_cache->i_mapping)
 static bool erofs_folio_is_managed(struct erofs_sb_info *sbi, struct folio *fo)
 {
 	return fo->mapping == MNGD_MAPPING(sbi);
@@ -292,7 +292,6 @@ static struct workqueue_struct *z_erofs_workqueue __read_mostly;
 
 #ifdef CONFIG_EROFS_FS_PCPU_KTHREAD
 static struct kthread_worker __rcu **z_erofs_pcpu_workers;
-static atomic_t erofs_percpu_workers_initialized = ATOMIC_INIT(0);
 
 static void erofs_destroy_percpu_workers(void)
 {
@@ -338,8 +337,12 @@ static int erofs_init_percpu_workers(void)
 	}
 	return 0;
 }
+#else
+static inline void erofs_destroy_percpu_workers(void) {}
+static inline int erofs_init_percpu_workers(void) { return 0; }
+#endif
 
-#ifdef CONFIG_HOTPLUG_CPU
+#if defined(CONFIG_HOTPLUG_CPU) && defined(CONFIG_EROFS_FS_PCPU_KTHREAD)
 static DEFINE_SPINLOCK(z_erofs_pcpu_worker_lock);
 static enum cpuhp_state erofs_cpuhp_state;
 
@@ -396,53 +399,15 @@ static void erofs_cpu_hotplug_destroy(void)
 	if (erofs_cpuhp_state)
 		cpuhp_remove_state_nocalls(erofs_cpuhp_state);
 }
-#else /* !CONFIG_HOTPLUG_CPU  */
+#else /* !CONFIG_HOTPLUG_CPU || !CONFIG_EROFS_FS_PCPU_KTHREAD */
 static inline int erofs_cpu_hotplug_init(void) { return 0; }
 static inline void erofs_cpu_hotplug_destroy(void) {}
-#endif/* CONFIG_HOTPLUG_CPU */
-static int z_erofs_init_pcpu_workers(struct super_block *sb)
-{
-	int err;
-
-	if (atomic_xchg(&erofs_percpu_workers_initialized, 1))
-		return 0;
-
-	err = erofs_init_percpu_workers();
-	if (err) {
-		erofs_err(sb, "per-cpu workers: failed to allocate.");
-		goto err_init_percpu_workers;
-	}
-
-	err = erofs_cpu_hotplug_init();
-	if (err < 0) {
-		erofs_err(sb, "per-cpu workers: failed CPU hotplug init.");
-		goto err_cpuhp_init;
-	}
-	erofs_info(sb, "initialized per-cpu workers successfully.");
-	return err;
-
-err_cpuhp_init:
-	erofs_destroy_percpu_workers();
-err_init_percpu_workers:
-	atomic_set(&erofs_percpu_workers_initialized, 0);
-	return err;
-}
-
-static void z_erofs_destroy_pcpu_workers(void)
-{
-	if (!atomic_xchg(&erofs_percpu_workers_initialized, 0))
-		return;
-	erofs_cpu_hotplug_destroy();
-	erofs_destroy_percpu_workers();
-}
-#else /* !CONFIG_EROFS_FS_PCPU_KTHREAD */
-static inline int z_erofs_init_pcpu_workers(struct super_block *sb) { return 0; }
-static inline void z_erofs_destroy_pcpu_workers(void) {}
-#endif/* CONFIG_EROFS_FS_PCPU_KTHREAD */
+#endif
 
 void z_erofs_exit_subsystem(void)
 {
-	z_erofs_destroy_pcpu_workers();
+	erofs_cpu_hotplug_destroy();
+	erofs_destroy_percpu_workers();
 	destroy_workqueue(z_erofs_workqueue);
 	z_erofs_destroy_pcluster_pool();
 	z_erofs_exit_decompressor();
@@ -466,8 +431,19 @@ int __init z_erofs_init_subsystem(void)
 		goto err_workqueue_init;
 	}
 
+	err = erofs_init_percpu_workers();
+	if (err)
+		goto err_pcpu_worker;
+
+	err = erofs_cpu_hotplug_init();
+	if (err < 0)
+		goto err_cpuhp_init;
 	return err;
 
+err_cpuhp_init:
+	erofs_destroy_percpu_workers();
+err_pcpu_worker:
+	destroy_workqueue(z_erofs_workqueue);
 err_workqueue_init:
 	z_erofs_destroy_pcluster_pool();
 err_pcluster_pool:
@@ -675,14 +651,8 @@ static const struct address_space_operations z_erofs_cache_aops = {
 
 int z_erofs_init_super(struct super_block *sb)
 {
-	struct inode *inode;
-	int err;
+	struct inode *const inode = new_inode(sb);
 
-	err = z_erofs_init_pcpu_workers(sb);
-	if (err)
-		return err;
-
-	inode = new_inode(sb);
 	if (!inode)
 		return -ENOMEM;
 	set_nlink(inode, 1);
@@ -1108,21 +1078,6 @@ static int z_erofs_scan_folio(struct z_erofs_frontend *f,
 	return err;
 }
 
-static bool z_erofs_is_sync_decompress(struct erofs_sb_info *sbi,
-				       unsigned int readahead_pages)
-{
-	/* auto: enable for read_folio, disable for readahead */
-	if ((sbi->opt.sync_decompress == EROFS_SYNC_DECOMPRESS_AUTO) &&
-	    !readahead_pages)
-		return true;
-
-	if ((sbi->opt.sync_decompress == EROFS_SYNC_DECOMPRESS_FORCE_ON) &&
-	    (readahead_pages <= sbi->opt.max_sync_decompress_pages))
-		return true;
-
-	return false;
-}
-
 static bool z_erofs_page_is_invalidated(struct page *page)
 {
 	return !page_folio(page)->mapping && !z_erofs_is_shortlived_page(page);
@@ -1275,14 +1230,14 @@ static int z_erofs_parse_in_bvecs(struct z_erofs_backend *be, bool *overlapped)
 	return err;
 }
 
-static int z_erofs_decompress_pcluster(struct z_erofs_backend *be, int err)
+static int z_erofs_decompress_pcluster(struct z_erofs_backend *be, bool eio)
 {
 	struct erofs_sb_info *const sbi = EROFS_SB(be->sb);
 	struct z_erofs_pcluster *pcl = be->pcl;
 	unsigned int pclusterpages = z_erofs_pclusterpages(pcl);
 	const struct z_erofs_decompressor *decomp =
 				z_erofs_decomp[pcl->algorithmformat];
-	int i, j, jtop, err2;
+	int i, j, jtop, err2, err = eio ? -EIO : 0;
 	struct page *page;
 	bool overlapped;
 	bool try_free = true;
@@ -1322,6 +1277,8 @@ static int z_erofs_decompress_pcluster(struct z_erofs_backend *be, int err)
 					.sb = be->sb,
 					.in = be->compressed_pages,
 					.out = be->decompressed_pages,
+					.inpages = pclusterpages,
+					.outpages = be->nr_pages,
 					.pageofs_in = pcl->pageofs_in,
 					.pageofs_out = pcl->pageofs_out,
 					.inputsize = pcl->pclustersize,
@@ -1412,12 +1369,12 @@ static int z_erofs_decompress_queue(const struct z_erofs_decompressqueue *io,
 		.pcl = io->head,
 	};
 	struct z_erofs_pcluster *next;
-	int err = io->eio ? -EIO : 0;
+	int err = 0;
 
 	for (; be.pcl != Z_EROFS_PCLUSTER_TAIL; be.pcl = next) {
 		DBG_BUGON(!be.pcl);
 		next = READ_ONCE(be.pcl->next);
-		err = z_erofs_decompress_pcluster(&be, err) ?: err;
+		err = z_erofs_decompress_pcluster(&be, io->eio) ?: err;
 	}
 	return err;
 }
@@ -1467,6 +1424,9 @@ static void z_erofs_decompress_kickoff(struct z_erofs_decompressqueue *io,
 	if (atomic_add_return(bios, &io->pending_bios))
 		return;
 	if (z_erofs_in_atomic()) {
+		/* See `sync_decompress` in sysfs-fs-erofs for more details */
+		if (sbi->sync_decompress == EROFS_SYNC_DECOMPRESS_AUTO)
+			sbi->sync_decompress = EROFS_SYNC_DECOMPRESS_FORCE_ON;
 #ifdef CONFIG_EROFS_FS_PCPU_KTHREAD
 		struct kthread_worker *worker;
 
@@ -1483,9 +1443,6 @@ static void z_erofs_decompress_kickoff(struct z_erofs_decompressqueue *io,
 #else
 		queue_work(z_erofs_workqueue, &io->u.work);
 #endif
-		/* enable sync decompression for readahead */
-		if (sbi->opt.sync_decompress == EROFS_SYNC_DECOMPRESS_AUTO)
-			sbi->opt.sync_decompress = EROFS_SYNC_DECOMPRESS_FORCE_ON;
 		return;
 	}
 	gfp_flag = memalloc_noio_save();
@@ -1764,8 +1721,7 @@ drain_io:
 					bio = bio_alloc(mdev.m_bdev, BIO_MAX_VECS,
 							REQ_OP_READ, GFP_NOIO);
 				bio->bi_end_io = z_erofs_endio;
-				bio->bi_iter.bi_sector =
-						(mdev.m_dif->fsoff + cur) >> 9;
+				bio->bi_iter.bi_sector = cur >> 9;
 				bio->bi_private = q[JQ_SUBMIT];
 				if (readahead)
 					bio->bi_opf |= REQ_RAHEAD;
@@ -1807,16 +1763,21 @@ drain_io:
 	z_erofs_decompress_kickoff(q[JQ_SUBMIT], nr_bios);
 }
 
-static int z_erofs_runqueue(struct z_erofs_frontend *f, unsigned int rapages)
+static int z_erofs_runqueue(struct z_erofs_frontend *f, unsigned int rabytes)
 {
 	struct z_erofs_decompressqueue io[NR_JOBQUEUES];
 	struct erofs_sb_info *sbi = EROFS_I_SB(f->inode);
-	bool force_fg = z_erofs_is_sync_decompress(sbi, rapages);
+	int syncmode = sbi->sync_decompress;
+	bool force_fg;
 	int err;
+
+	force_fg = (syncmode == EROFS_SYNC_DECOMPRESS_AUTO && !rabytes) ||
+		(syncmode == EROFS_SYNC_DECOMPRESS_FORCE_ON &&
+			(rabytes <= Z_EROFS_MAX_SYNC_DECOMPRESS_BYTES));
 
 	if (f->head == Z_EROFS_PCLUSTER_TAIL)
 		return 0;
-	z_erofs_submit_queue(f, io, &force_fg, !!rapages);
+	z_erofs_submit_queue(f, io, &force_fg, !!rabytes);
 
 	/* handle bypass queue (no i/o pclusters) immediately */
 	err = z_erofs_decompress_queue(&io[JQ_BYPASS], &f->pagepool);
@@ -1937,7 +1898,7 @@ static void z_erofs_readahead(struct readahead_control *rac)
 	z_erofs_pcluster_readmore(&f, rac, false);
 	z_erofs_pcluster_end(&f);
 
-	(void)z_erofs_runqueue(&f, nrpages);
+	(void)z_erofs_runqueue(&f, nrpages << PAGE_SHIFT);
 	erofs_put_metabuf(&f.map.buf);
 	erofs_release_pages(&f.pagepool);
 }
