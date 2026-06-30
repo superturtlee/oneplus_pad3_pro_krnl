@@ -2961,7 +2961,8 @@ static int amdgpu_device_ip_init(struct amdgpu_device *adev)
 	if (r)
 		goto init_failed;
 
-	if (adev->mman.buffer_funcs_ring->sched.ready)
+	if (adev->mman.buffer_funcs_ring &&
+	    adev->mman.buffer_funcs_ring->sched.ready)
 		amdgpu_ttm_set_buffer_funcs_status(adev, true);
 
 	/* Don't init kfd if whole hive need to be reset during init */
@@ -5314,6 +5315,9 @@ int amdgpu_device_mode1_reset(struct amdgpu_device *adev)
 
 	if (ret)
 		goto mode1_reset_failed;
+
+	/* enable mmio access after mode 1 reset completed */
+	adev->no_hw_access = false;
 
 	amdgpu_device_load_pci_state(adev->pdev);
 	ret = amdgpu_psp_wait_for_bootloader(adev);
