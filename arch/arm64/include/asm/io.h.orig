@@ -275,23 +275,10 @@ typedef int (*ioremap_prot_hook_t)(phys_addr_t phys_addr, size_t size,
 				   pgprot_t *prot);
 int arm64_ioremap_prot_hook_register(const ioremap_prot_hook_t hook);
 
-static inline void __iomem *ioremap_prot(phys_addr_t phys, size_t size,
-					 unsigned long user_prot)
-{
-	pgprot_t prot;
-	pteval_t user_prot_val = pgprot_val(__pgprot(user_prot));
-
-	if (WARN_ON_ONCE(!(user_prot_val & PTE_USER)))
-		return NULL;
-
-	prot = __pgprot_modify(PAGE_KERNEL, PTE_ATTRINDX_MASK,
-			       user_prot_val & PTE_ATTRINDX_MASK);
-	return __ioremap_prot(phys, size, prot);
-}
 #define ioremap_prot ioremap_prot
 
-#define ioremap(addr, size)	\
-	__ioremap_prot((addr), (size), __pgprot(PROT_DEVICE_nGnRE))
+#define _PAGE_IOREMAP PROT_DEVICE_nGnRE
+
 #define ioremap_wc(addr, size)	\
 	ioremap_prot((addr), (size), PROT_NORMAL_NC)
 #define ioremap_np(addr, size)	\
