@@ -230,6 +230,7 @@ static int crypto_authenc_esn_decrypt_tail(struct aead_request *req,
 	struct scatterlist *dst = req->dst;
 	u8 *ihash = ohash + crypto_ahash_digestsize(auth);
 	u32 tmp[2];
+	int err;
 
 	if (!authsize)
 		goto decrypt;
