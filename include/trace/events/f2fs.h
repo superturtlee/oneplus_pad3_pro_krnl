@@ -1119,11 +1119,11 @@ TRACE_EVENT(f2fs_reserve_new_blocks,
 		(unsigned long long)__entry->count)
 );
 
-DECLARE_EVENT_CLASS(f2fs__submit_folio_bio,
+DECLARE_EVENT_CLASS(f2fs__submit_page_bio,
 
-	TP_PROTO(struct folio *folio, struct f2fs_io_info *fio),
+	TP_PROTO(struct page *page, struct f2fs_io_info *fio),
 
-	TP_ARGS(folio, fio),
+	TP_ARGS(page, fio),
 
 	TP_STRUCT__entry(
 		__field(dev_t, dev)
@@ -1138,9 +1138,9 @@ DECLARE_EVENT_CLASS(f2fs__submit_folio_bio,
 	),
 
 	TP_fast_assign(
-		__entry->dev		= folio->mapping->host->i_sb->s_dev;
-		__entry->ino		= folio->mapping->host->i_ino;
-		__entry->index		= folio->index;
+		__entry->dev		= page_file_mapping(page)->host->i_sb->s_dev;
+		__entry->ino		= page_file_mapping(page)->host->i_ino;
+		__entry->index		= page->index;
 		__entry->old_blkaddr	= fio->old_blkaddr;
 		__entry->new_blkaddr	= fio->new_blkaddr;
 		__entry->op		= fio->op;
@@ -1149,7 +1149,7 @@ DECLARE_EVENT_CLASS(f2fs__submit_folio_bio,
 		__entry->type		= fio->type;
 	),
 
-	TP_printk("dev = (%d,%d), ino = %lu, folio_index = 0x%lx, "
+	TP_printk("dev = (%d,%d), ino = %lu, page_index = 0x%lx, "
 		"oldaddr = 0x%llx, newaddr = 0x%llx, rw = %s(%s), type = %s_%s",
 		show_dev_ino(__entry),
 		(unsigned long)__entry->index,
@@ -1160,22 +1160,22 @@ DECLARE_EVENT_CLASS(f2fs__submit_folio_bio,
 		show_block_type(__entry->type))
 );
 
-DEFINE_EVENT_CONDITION(f2fs__submit_folio_bio, f2fs_submit_folio_bio,
+DEFINE_EVENT_CONDITION(f2fs__submit_page_bio, f2fs_submit_page_bio,
 
-	TP_PROTO(struct folio *folio, struct f2fs_io_info *fio),
+	TP_PROTO(struct page *page, struct f2fs_io_info *fio),
 
-	TP_ARGS(folio, fio),
+	TP_ARGS(page, fio),
 
-	TP_CONDITION(folio->mapping)
+	TP_CONDITION(page->mapping)
 );
 
-DEFINE_EVENT_CONDITION(f2fs__submit_folio_bio, f2fs_submit_folio_write,
+DEFINE_EVENT_CONDITION(f2fs__submit_page_bio, f2fs_submit_page_write,
 
-	TP_PROTO(struct folio *folio, struct f2fs_io_info *fio),
+	TP_PROTO(struct page *page, struct f2fs_io_info *fio),
 
-	TP_ARGS(folio, fio),
+	TP_ARGS(page, fio),
 
-	TP_CONDITION(folio->mapping)
+	TP_CONDITION(page->mapping)
 );
 
 DECLARE_EVENT_CLASS(f2fs__bio,
@@ -1322,11 +1322,12 @@ DECLARE_EVENT_CLASS(f2fs__folio,
 	),
 
 	TP_fast_assign(
-		__entry->dev	= folio->mapping->host->i_sb->s_dev;
-		__entry->ino	= folio->mapping->host->i_ino;
+		__entry->dev	= folio_file_mapping(folio)->host->i_sb->s_dev;
+		__entry->ino	= folio_file_mapping(folio)->host->i_ino;
 		__entry->type	= type;
-		__entry->dir	= S_ISDIR(folio->mapping->host->i_mode);
-		__entry->index	= folio->index;
+		__entry->dir	=
+			S_ISDIR(folio_file_mapping(folio)->host->i_mode);
+		__entry->index	= folio_index(folio);
 		__entry->dirty	= folio_test_dirty(folio);
 		__entry->uptodate = folio_test_uptodate(folio);
 	),
@@ -2404,123 +2405,6 @@ DEFINE_EVENT(f2fs__rw_end, f2fs_datawrite_end,
 	TP_ARGS(inode, offset, bytes)
 );
 
-#ifdef CONFIG_F2FS_FS_DEDUP
-DECLARE_EVENT_CLASS(f2fs__dedup_inode,
-
-	TP_PROTO(struct inode *inode, struct inode *inner),
-
-	TP_ARGS(inode, inner),
-
-	TP_STRUCT__entry(
-		__field(dev_t,  dev)
-		__field(ino_t,  ino)
-		__field(ino_t,  pino)
-		__field(loff_t, size)
-		__field(unsigned int, nlink)
-		__field(ino_t,  inner_ino)
-		__field(unsigned int, inner_nlink)
-	),
-
-	TP_fast_assign(
-		__entry->dev    = inode->i_sb->s_dev;
-		__entry->ino    = inode->i_ino;
-		__entry->pino   = F2FS_I(inode)->i_pino;
-		__entry->nlink  = inode->i_nlink;
-		__entry->size   = inode->i_size;
-		__entry->inner_ino      = inner->i_ino;
-		__entry->inner_nlink    = inner->i_nlink;
-	),
-
-	TP_printk("dev = (%d,%d), ino = %lu, pino = %lu, "
-		"i_size = %lld, i_nlink = %u, "
-		"inner = %lu, inner i_nlink = %u",
-		show_dev_ino(__entry),
-		(unsigned long)__entry->pino,
-		__entry->size,
-		(unsigned int)__entry->nlink,
-		(unsigned long)__entry->inner_ino,
-		(unsigned int)__entry->inner_nlink)
-);
-
-DEFINE_EVENT(f2fs__dedup_inode, f2fs_dedup_ioc_create_layered_inode,
-
-	TP_PROTO(struct inode *inode, struct inode *inner),
-
-	TP_ARGS(inode, inner)
-);
-
-DEFINE_EVENT(f2fs__dedup_inode, f2fs_dedup_ioc_dedup_inode,
-
-	TP_PROTO(struct inode *inode, struct inode *inner),
-
-	TP_ARGS(inode, inner)
-);
-
-DEFINE_EVENT(f2fs__dedup_inode, f2fs_dedup_revoke_inode,
-
-	TP_PROTO(struct inode *inode, struct inode *inner),
-
-	TP_ARGS(inode, inner)
-);
-
-DEFINE_EVENT(f2fs__dedup_inode, f2fs_dedup_revoke_fail,
-
-	TP_PROTO(struct inode *inode, struct inode *inner),
-
-	TP_ARGS(inode, inner)
-);
-
-DEFINE_EVENT(f2fs__dedup_inode, f2fs_dedup_dec_inner_link,
-
-	TP_PROTO(struct inode *inode, struct inode *inner),
-
-	TP_ARGS(inode, inner)
-);
-
-DECLARE_EVENT_CLASS(f2fs__dedup_map,
-
-	TP_PROTO(struct inode *inode, struct inode *inner),
-
-	TP_ARGS(inode, inner),
-
-	TP_STRUCT__entry(
-		__field(dev_t,  dev)
-		__field(ino_t,  ino)
-		__field(loff_t, size)
-		__field(ino_t,  inner_ino)
-		__field(unsigned int, inner_nlink)
-	),
-
-	TP_fast_assign(
-		__entry->dev    = inode->i_sb->s_dev;
-		__entry->ino    = inode->i_ino;
-		__entry->size   = inode->i_size;
-		__entry->inner_ino      = inner->i_ino;
-		__entry->inner_nlink    = inner->i_nlink;
-	),
-
-	TP_printk("dev = (%d,%d), outer ino = %lu, i_size = %lld, "
-		"map to inner ino = %lu, inner i_nlink = %u",
-		show_dev_ino(__entry),
-		__entry->size,
-		(unsigned long)__entry->inner_ino,
-		(unsigned int)__entry->inner_nlink)
-);
-
-DEFINE_EVENT(f2fs__dedup_map, f2fs_dedup_map_readpage,
-
-	TP_PROTO(struct inode *inode, struct inode *inner),
-
-	TP_ARGS(inode, inner)
-);
-
-DEFINE_EVENT(f2fs__dedup_map, f2fs_dedup_map_blocks,
-
-	TP_PROTO(struct inode *inode, struct inode *inner),
-
-	TP_ARGS(inode, inner)
-);
-#endif /* CONFIG_F2FS_FS_DEDUP */
 #endif /* _TRACE_F2FS_H */
 
  /* This part must be outside protection */
