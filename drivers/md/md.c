@@ -106,7 +106,7 @@ static int remove_and_add_spares(struct mddev *mddev,
 				 struct md_rdev *this);
 static void mddev_detach(struct mddev *mddev);
 static void export_rdev(struct md_rdev *rdev, struct mddev *mddev);
-static void md_wakeup_thread_directly(struct md_thread __rcu **thread);
+static void md_wakeup_thread_directly(struct md_thread __rcu *thread);
 
 /*
  * Default number of read corrections we'll attempt on an rdev
@@ -470,17 +470,6 @@ int mddev_suspend(struct mddev *mddev, bool interruptible)
 	}
 
 	percpu_ref_kill(&mddev->active_io);
-
-	/*
-	 * RAID456 IO can sleep in wait_for_reshape while still holding an
-	 * active_io reference. If reshape is already interrupted or frozen,
-	 * wake those waiters so they can abort and drop the reference instead
-	 * of deadlocking suspend.
-	 */
-	if (mddev->pers && mddev->pers->prepare_suspend &&
-	    reshape_interrupted(mddev))
-		mddev->pers->prepare_suspend(mddev);
-
 	if (interruptible)
 		err = wait_event_interruptible(mddev->sb_wait,
 				percpu_ref_is_zero(&mddev->active_io));
@@ -3740,6 +3729,7 @@ out_free_rdev:
 
 static int analyze_sbs(struct mddev *mddev)
 {
+	int i;
 	struct md_rdev *rdev, *freshest, *tmp;
 
 	freshest = NULL;
@@ -3766,9 +3756,11 @@ static int analyze_sbs(struct mddev *mddev)
 	super_types[mddev->major_version].
 		validate_super(mddev, NULL/*freshest*/, freshest);
 
+	i = 0;
 	rdev_for_each_safe(rdev, tmp, mddev) {
 		if (mddev->max_disks &&
-		    rdev->desc_nr >= mddev->max_disks) {
+		    (rdev->desc_nr >= mddev->max_disks ||
+		     i > mddev->max_disks)) {
 			pr_warn("md: %s: %pg: only %d devices permitted\n",
 				mdname(mddev), rdev->bdev,
 				mddev->max_disks);
@@ -4907,7 +4899,7 @@ static void stop_sync_thread(struct mddev *mddev, bool locked)
 	 * Thread might be blocked waiting for metadata update which will now
 	 * never happen
 	 */
-	md_wakeup_thread_directly(&mddev->sync_thread);
+	md_wakeup_thread_directly(mddev->sync_thread);
 	if (work_pending(&mddev->sync_work))
 		flush_work(&mddev->sync_work);
 
@@ -8059,21 +8051,22 @@ static int md_thread(void *arg)
 	return 0;
 }
 
-static void md_wakeup_thread_directly(struct md_thread __rcu **thread)
+static void md_wakeup_thread_directly(struct md_thread __rcu *thread)
 {
 	struct md_thread *t;
 
 	rcu_read_lock();
-	t = rcu_dereference(*thread);
+	t = rcu_dereference(thread);
 	if (t)
 		wake_up_process(t->tsk);
 	rcu_read_unlock();
 }
 
-void __md_wakeup_thread(struct md_thread __rcu *thread)
+void md_wakeup_thread(struct md_thread __rcu *thread)
 {
 	struct md_thread *t;
 
+	rcu_read_lock();
 	t = rcu_dereference(thread);
 	if (t) {
 		pr_debug("md: waking up MD thread %s.\n", t->tsk->comm);
@@ -8081,8 +8074,9 @@ void __md_wakeup_thread(struct md_thread __rcu *thread)
 		if (wq_has_sleeper(&t->wqueue))
 			wake_up(&t->wqueue);
 	}
+	rcu_read_unlock();
 }
-EXPORT_SYMBOL(__md_wakeup_thread);
+EXPORT_SYMBOL(md_wakeup_thread);
 
 struct md_thread *md_register_thread(void (*run) (struct md_thread *),
 		struct mddev *mddev, const char *name)

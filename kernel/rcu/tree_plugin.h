@@ -685,10 +685,7 @@ static void rcu_read_unlock_special(struct task_struct *t)
 			// Using softirq, safe to awaken, and either the
 			// wakeup is free or there is either an expedited
 			// GP in flight or a potential need to deboost.
-			if (rdp->defer_qs_iw_pending != DEFER_QS_PENDING) {
-				rdp->defer_qs_iw_pending = DEFER_QS_PENDING;
-				raise_softirq_irqoff(RCU_SOFTIRQ);
-			}
+			raise_softirq_irqoff(RCU_SOFTIRQ);
 		} else {
 			// Enabling BH or preempt does reschedule, so...
 			// Also if no expediting and no possible deboosting,

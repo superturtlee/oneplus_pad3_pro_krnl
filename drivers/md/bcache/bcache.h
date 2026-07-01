@@ -273,8 +273,6 @@ struct bcache_device {
 
 	struct bio_set		bio_split;
 
-	struct bio_set		bio_detached;
-
 	unsigned int		data_csum:1;
 
 	int (*cache_miss)(struct btree *b, struct search *s,
@@ -755,13 +753,6 @@ struct bbio {
 		 */
 	};
 	struct bio		bio;
-};
-
-struct detached_dev_io_private {
-	struct bcache_device	*d;
-	unsigned long		start_time;
-	struct bio		*orig_bio;
-	struct bio              bio;
 };
 
 #define BTREE_PRIO		USHRT_MAX
