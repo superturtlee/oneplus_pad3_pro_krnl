@@ -886,23 +886,23 @@ __nfqnl_enqueue_packet(struct net *net, struct nfqnl_instance *queue,
 	}
 	spin_lock_bh(&queue->lock);
 
-	if (queue->queue_total >= queue->queue_maxlen)
-		goto err_out_queue_drop;
-
+	if (queue->queue_total >= queue->queue_maxlen) {
+		if (queue->flags & NFQA_CFG_F_FAIL_OPEN) {
+			failopen = 1;
+			err = 0;
+		} else {
+			queue->queue_dropped++;
+			net_warn_ratelimited("nf_queue: full at %d entries, dropping packets(s)\n",
+					     queue->queue_total);
+		}
+		goto err_out_free_nskb;
+	}
 	entry->id = ++queue->id_sequence;
 	*packet_id_ptr = htonl(entry->id);
-
-	/* Insert into hash BEFORE unicast. If failure don't send to userspace. */
-	err = __enqueue_entry(queue, entry);
-	if (unlikely(err))
-		goto err_out_queue_drop;
 
 	/* nfnetlink_unicast will either free the nskb or add it to a socket */
 	err = nfnetlink_unicast(nskb, net, queue->peer_portid);
 	if (err < 0) {
-		/* Unicast failed - remove entry we just inserted */
-		__dequeue_entry(queue, entry);
-
 		if (queue->flags & NFQA_CFG_F_FAIL_OPEN) {
 			failopen = 1;
 			err = 0;
@@ -912,22 +912,12 @@ __nfqnl_enqueue_packet(struct net *net, struct nfqnl_instance *queue,
 		goto err_out_unlock;
 	}
 
+	__enqueue_entry(queue, entry);
+
 	spin_unlock_bh(&queue->lock);
 	return 0;
 
-err_out_queue_drop:
-	if (queue->flags & NFQA_CFG_F_FAIL_OPEN) {
-		failopen = 1;
-		err = 0;
-	} else {
-		queue->queue_dropped++;
-
-		if (queue->queue_total >= queue->queue_maxlen)
-			net_warn_ratelimited("nf_queue: full at %d entries, dropping packets(s)\n",
-					     queue->queue_total);
-		else
-			net_warn_ratelimited("nf_queue: hash insert failed: %d\n", err);
-	}
+err_out_free_nskb:
 	kfree_skb(nskb);
 err_out_unlock:
 	spin_unlock_bh(&queue->lock);
