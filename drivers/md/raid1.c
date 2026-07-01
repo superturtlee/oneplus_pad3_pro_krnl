@@ -3247,8 +3247,6 @@ static int raid1_run(struct mddev *mddev)
 		ret = raid1_set_limits(mddev);
 		if (ret) {
 			md_unregister_thread(mddev, &conf->thread);
-			if (!mddev->private)
-				raid1_free(mddev, conf);
 			return ret;
 		}
 	}
