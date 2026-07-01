@@ -60,7 +60,7 @@ static int usb_start_wait_urb(struct urb *urb, int timeout, int *actual_length)
 	if (unlikely(retval))
 		goto out;
 
-	if (!killable && (timeout <= 0 || timeout > USB_MAX_SYNCHRONOUS_TIMEOUT))
+	if (timeout <= 0 || timeout > USB_MAX_SYNCHRONOUS_TIMEOUT)
 		timeout = USB_MAX_SYNCHRONOUS_TIMEOUT;
 	expire = (timeout > 0) ? msecs_to_jiffies(timeout) : MAX_SCHEDULE_TIMEOUT;
 	if (!wait_for_completion_timeout(&ctx.done, expire)) {
