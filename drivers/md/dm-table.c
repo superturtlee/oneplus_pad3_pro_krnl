@@ -257,7 +257,7 @@ static int device_area_is_invalid(struct dm_target *ti, struct dm_dev *dev,
 	if (bdev_is_zoned(bdev)) {
 		unsigned int zone_sectors = bdev_zone_sectors(bdev);
 
-		if (!bdev_is_zone_aligned(bdev, start)) {
+		if (start & (zone_sectors - 1)) {
 			DMERR("%s: start=%llu not aligned to h/w zone size %u of %pg",
 			      dm_device_name(ti->table->md),
 			      (unsigned long long)start,
@@ -274,7 +274,7 @@ static int device_area_is_invalid(struct dm_target *ti, struct dm_dev *dev,
 		 * devices do not end up with a smaller zone in the middle of
 		 * the sector range.
 		 */
-		if (!bdev_is_zone_aligned(bdev, len)) {
+		if (len & (zone_sectors - 1)) {
 			DMERR("%s: len=%llu not aligned to h/w zone size %u of %pg",
 			      dm_device_name(ti->table->md),
 			      (unsigned long long)len,
@@ -1205,68 +1205,6 @@ put_live_table:
 	return 0;
 }
 
-struct dm_derive_sw_secret_args {
-	const u8 *eph_key;
-	size_t eph_key_size;
-	u8 *sw_secret;
-	int err;
-};
-
-static int dm_derive_sw_secret_callback(struct dm_target *ti,
-					struct dm_dev *dev, sector_t start,
-					sector_t len, void *data)
-{
-	struct dm_derive_sw_secret_args *args = data;
-
-	if (!args->err)
-		return 0;
-
-	args->err = blk_crypto_derive_sw_secret(dev->bdev,
-						args->eph_key,
-						args->eph_key_size,
-						args->sw_secret);
-	/* Try another device in case this fails. */
-	return 0;
-}
-
-/*
- * Retrieve the sw_secret from the underlying device.  Given that only one
- * sw_secret can exist for a particular wrapped key, retrieve it only from the
- * first device that supports derive_sw_secret().
- */
-static int dm_derive_sw_secret(struct blk_crypto_profile *profile,
-			       const u8 *eph_key, size_t eph_key_size,
-			       u8 sw_secret[BLK_CRYPTO_SW_SECRET_SIZE])
-{
-	struct mapped_device *md =
-		container_of(profile, struct dm_crypto_profile, profile)->md;
-	struct dm_derive_sw_secret_args args = {
-		.eph_key = eph_key,
-		.eph_key_size = eph_key_size,
-		.sw_secret = sw_secret,
-		.err = -EOPNOTSUPP,
-	};
-	struct dm_table *t;
-	int srcu_idx;
-	int i;
-	struct dm_target *ti;
-
-	t = dm_get_live_table(md, &srcu_idx);
-	if (!t)
-		return -EOPNOTSUPP;
-	for (i = 0; i < t->num_targets; i++) {
-		ti = dm_table_get_target(t, i);
-		if (!ti->type->iterate_devices)
-			continue;
-		ti->type->iterate_devices(ti, dm_derive_sw_secret_callback,
-					  &args);
-		if (!args.err)
-			break;
-	}
-	dm_put_live_table(md, srcu_idx);
-	return args.err;
-}
-
 static int
 device_intersect_crypto_capabilities(struct dm_target *ti, struct dm_dev *dev,
 				     sector_t start, sector_t len, void *data)
@@ -1322,11 +1260,9 @@ static int dm_table_construct_crypto_profile(struct dm_table *t)
 	profile = &dmcp->profile;
 	blk_crypto_profile_init(profile, 0);
 	profile->ll_ops.keyslot_evict = dm_keyslot_evict;
-	profile->ll_ops.derive_sw_secret = dm_derive_sw_secret;
 	profile->max_dun_bytes_supported = UINT_MAX;
 	memset(profile->modes_supported, 0xFF,
 	       sizeof(profile->modes_supported));
-	profile->key_types_supported = ~0;
 
 	for (i = 0; i < t->num_targets; i++) {
 		struct dm_target *ti = dm_table_get_target(t, i);
@@ -1648,8 +1584,8 @@ static int validate_hardware_zoned(struct dm_table *t, bool zoned,
 		return -EINVAL;
 	}
 
-	/* Check zone size validity. */
-	if (!zone_sectors)
+	/* Check zone size validity and compatibility */
+	if (!zone_sectors || !is_power_of_2(zone_sectors))
 		return -EINVAL;
 
 	if (dm_table_any_dev_attr(t, device_not_matches_zone_sectors, &zone_sectors)) {

@@ -202,10 +202,11 @@ static int fec_is_erasure(struct dm_verity *v, struct dm_verity_io *io,
 			  u8 *want_digest, u8 *data)
 {
 	if (unlikely(verity_hash(v, io, data, 1 << v->data_dev_block_bits,
-				 io->tmp_digest, true)))
+				 verity_io_real_digest(v, io), true)))
 		return 0;
 
-	return memcmp(io->tmp_digest, want_digest, v->digest_size) != 0;
+	return memcmp(verity_io_real_digest(v, io), want_digest,
+		      v->digest_size) != 0;
 }
 
 /*
@@ -330,11 +331,7 @@ static int fec_alloc_bufs(struct dm_verity *v, struct dm_verity_fec_io *fio)
 		if (fio->bufs[n])
 			continue;
 
-		fio->bufs[n] = mempool_alloc(&v->fec->prealloc_pool, GFP_NOWAIT);
-		if (unlikely(!fio->bufs[n])) {
-			DMERR("failed to allocate FEC buffer");
-			return -ENOMEM;
-		}
+		fio->bufs[n] = mempool_alloc(&v->fec->prealloc_pool, GFP_NOIO);
 	}
 
 	/* try to allocate the maximum number of buffers */
@@ -376,7 +373,7 @@ static void fec_init_bufs(struct dm_verity *v, struct dm_verity_fec_io *fio)
  */
 static int fec_decode_rsb(struct dm_verity *v, struct dm_verity_io *io,
 			  struct dm_verity_fec_io *fio, u64 rsb, u64 offset,
-			  const u8 *want_digest, bool use_erasures)
+			  bool use_erasures)
 {
 	int r, neras = 0;
 	unsigned int pos;
@@ -402,11 +399,12 @@ static int fec_decode_rsb(struct dm_verity *v, struct dm_verity_io *io,
 
 	/* Always re-validate the corrected block against the expected hash */
 	r = verity_hash(v, io, fio->output, 1 << v->data_dev_block_bits,
-			io->tmp_digest, true);
+			verity_io_real_digest(v, io), true);
 	if (unlikely(r < 0))
 		return r;
 
-	if (memcmp(io->tmp_digest, want_digest, v->digest_size)) {
+	if (memcmp(verity_io_real_digest(v, io), verity_io_want_digest(v, io),
+		   v->digest_size)) {
 		DMERR_LIMIT("%s: FEC %llu: failed to correct (%d erasures)",
 			    v->data_dev->name, (unsigned long long)rsb, neras);
 		return -EILSEQ;
@@ -417,8 +415,7 @@ static int fec_decode_rsb(struct dm_verity *v, struct dm_verity_io *io,
 
 /* Correct errors in a block. Copies corrected block to dest. */
 int verity_fec_decode(struct dm_verity *v, struct dm_verity_io *io,
-		      enum verity_block_type type, const u8 *want_digest,
-		      sector_t block, u8 *dest)
+		      enum verity_block_type type, sector_t block, u8 *dest)
 {
 	int r;
 	struct dm_verity_fec_io *fio = fec_io(io);
@@ -459,9 +456,9 @@ int verity_fec_decode(struct dm_verity *v, struct dm_verity_io *io,
 	 * them first. Do a second attempt with erasures if the corruption is
 	 * bad enough.
 	 */
-	r = fec_decode_rsb(v, io, fio, rsb, offset, want_digest, false);
+	r = fec_decode_rsb(v, io, fio, rsb, offset, false);
 	if (r < 0) {
-		r = fec_decode_rsb(v, io, fio, rsb, offset, want_digest, true);
+		r = fec_decode_rsb(v, io, fio, rsb, offset, true);
 		if (r < 0)
 			goto done;
 	}
@@ -671,7 +668,7 @@ int verity_fec_ctr(struct dm_verity *v)
 {
 	struct dm_verity_fec *f = v->fec;
 	struct dm_target *ti = v->ti;
-	u64 hash_blocks, fec_blocks;
+	u64 hash_blocks;
 	int ret;
 
 	if (!verity_fec_is_enabled(v)) {
@@ -734,7 +731,8 @@ int verity_fec_ctr(struct dm_verity *v)
 	 * it to be large enough.
 	 */
 	f->hash_blocks = f->blocks - v->data_blocks;
-	if (dm_bufio_get_device_size(v->bufio) < f->hash_blocks) {
+	if (dm_bufio_get_device_size(v->bufio) <
+	    v->hash_start + f->hash_blocks) {
 		ti->error = "Hash device is too small for "
 			DM_VERITY_OPT_FEC_BLOCKS;
 		return -E2BIG;
@@ -752,8 +750,7 @@ int verity_fec_ctr(struct dm_verity *v)
 
 	dm_bufio_set_sector_offset(f->bufio, f->start << (v->data_dev_block_bits - SECTOR_SHIFT));
 
-	fec_blocks = div64_u64(f->rounds * f->roots, v->fec->roots << SECTOR_SHIFT);
-	if (dm_bufio_get_device_size(f->bufio) < fec_blocks) {
+	if (dm_bufio_get_device_size(f->bufio) < f->rounds * f->roots) {
 		ti->error = "FEC device is too small";
 		return -E2BIG;
 	}
