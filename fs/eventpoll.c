@@ -799,6 +799,8 @@ static void ep_free(struct eventpoll *ep)
 	kfree_rcu(ep, rcu);
 }
 
+static struct file *epi_fget(const struct epitem *epi);
+
 /*
  * Removes a "struct epitem" from the eventpoll RB tree and deallocates
  * all the associated resources. Must be called with "mtx" held.
@@ -820,13 +822,34 @@ static bool __ep_remove(struct eventpoll *ep, struct epitem *epi, bool force)
 	 */
 	ep_unregister_pollwait(ep, epi);
 
-	/* Remove the current item from the list of epoll hooks */
-	spin_lock(&file->f_lock);
-	if (epi->dying && !force) {
-		spin_unlock(&file->f_lock);
-		return false;
+	if (!force) {
+		/* cheap sync with eventpoll_release_file() */
+		if (unlikely(READ_ONCE(epi->dying)))
+			return false;
+
+		/*
+		 * If we manage to grab a reference it means we're not in
+		 * eventpoll_release_file() and aren't going to be. Pinning
+		 * @file keeps it from reaching refcount zero and starting
+		 * __fput() while we clear and dereference file->f_ep and use
+		 * @file inside the f_lock critical section below, closing the
+		 * struct file / watched struct eventpoll UAF. A successful pin
+		 * also proves we are not racing eventpoll_release_file() on
+		 * this epi, so the redundant re-check of epi->dying under
+		 * f_lock is dropped.
+		 *
+		 * If the pin fails @file has already reached refcount zero and
+		 * its __fput() is in flight; because we bail before clearing
+		 * f_ep that path takes the eventpoll_release() slow path into
+		 * eventpoll_release_file(), which removes the epi under ep->mtx.
+		 */
+		file = epi_fget(epi);
+		if (!file)
+			return false;
 	}
 
+	/* Remove the current item from the list of epoll hooks */
+	spin_lock(&file->f_lock);
 	to_free = NULL;
 	head = file->f_ep;
 	if (head->first == &epi->fllink && !epi->fllink.next) {
@@ -861,6 +884,11 @@ static bool __ep_remove(struct eventpoll *ep, struct epitem *epi, bool force)
 	kfree_rcu(epi, rcu);
 
 	percpu_counter_dec(&ep->user->epoll_watches);
+
+	/* Drop the reference pinned above; not taken on the force path. */
+	if (!force)
+		fput(file);
+
 	return true;
 }
 
