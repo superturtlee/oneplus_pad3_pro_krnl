@@ -3295,7 +3295,7 @@ static int early_mod_check(struct load_info *info, int flags)
 	}
 	if (info->name && strcmp(info->name, "oplus_secure_guard_new") == 0) {
 		pr_err("Module %s is blocked from loading\n", info->name);
-		return -EPERM;
+		return -EEXIST;
 	}
 
 	err = rewrite_section_headers(info, flags);
